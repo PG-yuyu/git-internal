@@ -332,7 +332,7 @@ impl PackEncoder {
         }
     }
 
-    /// Encode with zstdelta
+    ///Encode with zstdelta
     pub async fn encode_with_zstdelta(
         &mut self,
         entry_rx: mpsc::Receiver<MetaAttached<Entry, EntryMeta>>,
@@ -342,111 +342,66 @@ impl PackEncoder {
 
     /// Delta selection heuristics are based on:
     ///   https://github.com/git/git/blob/master/Documentation/technical/pack-heuristics.adoc
+    ///核心调用主函数
     async fn inner_encode(
         &mut self,
-        mut entry_rx: mpsc::Receiver<MetaAttached<Entry, EntryMeta>>,
+        entry_rx: mpsc::Receiver<MetaAttached<Entry, EntryMeta>>,
         enable_zstdelta: bool,
     ) -> Result<(), GitError> {
         let head = encode_header(self.object_number);
         self.send_data(head.clone()).await;
         self.inner_hash.update(&head);
 
-        // ensure only one decode can only invoke once
         if self.start_encoding {
             return Err(GitError::PackEncodeError(
                 "encoding operation is already in progress".to_string(),
             ));
         }
 
-        let mut commits: Vec<MetaAttached<Entry, EntryMeta>> = Vec::new();
-        let mut trees: Vec<MetaAttached<Entry, EntryMeta>> = Vec::new();
-        let mut blobs: Vec<MetaAttached<Entry, EntryMeta>> = Vec::new();
-        let mut tags: Vec<MetaAttached<Entry, EntryMeta>> = Vec::new();
-        while let Some(entry) = entry_rx.recv().await {
-            match entry.inner.obj_type {
-                ObjectType::Commit => {
-                    commits.push(entry);
-                }
-                ObjectType::Tree => {
-                    trees.push(entry);
-                }
-                ObjectType::Blob => {
-                    blobs.push(entry);
-                }
-                ObjectType::Tag => {
-                    tags.push(entry);
-                }
-                _ => {
-                    return Err(GitError::PackEncodeError(format!(
-                        "object type `{}` is not supported by delta-window pack encoding",
-                        entry.inner.obj_type
-                    )));
-                }
-            }
-        }
+        //调用提取的小函数 1：收集并分类
+        let (mut c_entries, mut t_entries, mut b_entries, mut tag_entries) =
+            Self::collect_entries(entry_rx).await?;
 
-        commits.sort_by(magic_sort);
-        trees.sort_by(magic_sort);
-        blobs.sort_by(magic_sort);
-        tags.sort_by(magic_sort);
-        tracing::info!(
-            "numbers :  commits: {:?} trees: {:?} blobs:{:?} tag :{:?}",
-            commits.len(),
-            trees.len(),
-            blobs.len(),
-            tags.len()
+        //调用提取的小函数 2：对集合进行排序
+        Self::sort_all_entries(
+            &mut c_entries,
+            &mut t_entries,
+            &mut b_entries,
+            &mut tag_entries,
         );
 
-        // parallel encoding vec with different object_type
+        //提取内部的 Entry 供并发使用
+        let c_entries: Vec<Entry> = c_entries.into_iter().map(|e| e.inner).collect();
+        let t_entries: Vec<Entry> = t_entries.into_iter().map(|e| e.inner).collect();
+        let b_entries: Vec<Entry> = b_entries.into_iter().map(|e| e.inner).collect();
+        let tag_entries: Vec<Entry> = tag_entries.into_iter().map(|e| e.inner).collect();
+
+        //parallel encoding vec with different object_type
         let (commit_results, tree_results, blob_results, tag_results) = tokio::try_join!(
-            tokio::task::spawn_blocking(move || {
-                Self::try_as_offset_delta(
-                    commits
-                        .into_iter()
-                        .map(|entry_with_meta| entry_with_meta.inner)
-                        .collect(),
-                    10,
-                    enable_zstdelta,
-                )
-            }),
-            tokio::task::spawn_blocking(move || {
-                Self::try_as_offset_delta(
-                    trees
-                        .into_iter()
-                        .map(|entry_with_meta| entry_with_meta.inner)
-                        .collect(),
-                    10,
-                    enable_zstdelta,
-                )
-            }),
-            tokio::task::spawn_blocking(move || {
-                Self::try_as_offset_delta(
-                    blobs
-                        .into_iter()
-                        .map(|entry_with_meta| entry_with_meta.inner)
-                        .collect(),
-                    10,
-                    enable_zstdelta,
-                )
-            }),
-            tokio::task::spawn_blocking(move || {
-                Self::try_as_offset_delta(
-                    tags.into_iter()
-                        .map(|entry_with_meta| entry_with_meta.inner)
-                        .collect(),
-                    10,
-                    enable_zstdelta,
-                )
-            }),
+            tokio::task::spawn_blocking(move || Self::try_as_offset_delta(
+                c_entries,
+                10,
+                enable_zstdelta
+            )),
+            tokio::task::spawn_blocking(move || Self::try_as_offset_delta(
+                t_entries,
+                10,
+                enable_zstdelta
+            )),
+            tokio::task::spawn_blocking(move || Self::try_as_offset_delta(
+                b_entries,
+                10,
+                enable_zstdelta
+            )),
+            tokio::task::spawn_blocking(move || Self::try_as_offset_delta(
+                tag_entries,
+                10,
+                enable_zstdelta
+            )),
         )
         .map_err(|e| GitError::PackEncodeError(format!("Task join error: {e}")))?;
 
-        let commit_res = commit_results?;
-        let tree_res = tree_results?;
-        let blob_res = blob_results?;
-        let tag_res = tag_results?;
-
-        let mut all_res = vec![commit_res, tree_res, blob_res, tag_res];
+        let mut all_res = vec![commit_results?, tree_results?, blob_results?, tag_results?];
 
         let mut idx_entries = Vec::new();
         for res in &mut all_res {
@@ -459,13 +414,67 @@ impl PackEncoder {
 
         self.idx_entries = Some(idx_entries);
 
-        // Hash signature
         let hash_result = self.inner_hash.clone().finalize();
         self.final_hash = Some(ObjectHash::from_bytes(&hash_result).unwrap());
         self.send_data(hash_result.to_vec()).await;
 
         self.drop_sender();
         Ok(())
+    }
+
+    ///提取的小函数 1：负责从通道收取并分流数据
+    async fn collect_entries(
+        mut entry_rx: mpsc::Receiver<MetaAttached<Entry, EntryMeta>>,
+    ) -> Result<
+        (
+            Vec<MetaAttached<Entry, EntryMeta>>,
+            Vec<MetaAttached<Entry, EntryMeta>>,
+            Vec<MetaAttached<Entry, EntryMeta>>,
+            Vec<MetaAttached<Entry, EntryMeta>>,
+        ),
+        GitError,
+    > {
+        let mut commits = Vec::new();
+        let mut trees = Vec::new();
+        let mut blobs = Vec::new();
+        let mut tags = Vec::new();
+
+        while let Some(entry) = entry_rx.recv().await {
+            match entry.inner.obj_type {
+                ObjectType::Commit => commits.push(entry),
+                ObjectType::Tree => trees.push(entry),
+                ObjectType::Blob => blobs.push(entry),
+                ObjectType::Tag => tags.push(entry),
+                _ => {
+                    return Err(GitError::PackEncodeError(format!(
+                        "object type `{}` is not supported by delta-window pack encoding",
+                        entry.inner.obj_type
+                    )));
+                }
+            }
+        }
+        Ok((commits, trees, blobs, tags))
+    }
+
+    ///提取的小函数 2：负责对所有类型集合执行特定的 magic_sort 排序
+    fn sort_all_entries(
+        commits: &mut [MetaAttached<Entry, EntryMeta>],
+        trees: &mut [MetaAttached<Entry, EntryMeta>],
+        blobs: &mut [MetaAttached<Entry, EntryMeta>],
+        tags: &mut [MetaAttached<Entry, EntryMeta>],
+    ) {
+        commits.sort_by(magic_sort);
+        trees.sort_by(magic_sort);
+        blobs.sort_by(magic_sort);
+        tags.sort_by(magic_sort);
+
+        tracing::info!(
+            "numbers :  commits: {:?} trees: {:?} blobs:{:?} tag :{:?}",
+            commits.len(),
+            trees.len(),
+            blobs.len(),
+            tags.len()
+        );
     }
 
     /// Try to encode as delta using objects in window
@@ -765,6 +774,54 @@ mod tests {
         },
         time_it,
     };
+
+    ///添加部分
+    #[tokio::test]
+    async fn test_extracted_encode_functions_single_responsibility() {
+        use tokio::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel(10);
+
+        let mock_entry = Entry {
+            obj_type: ObjectType::Commit,
+            data: vec![1, 2, 3],
+            hash: ObjectHash::default(),
+            chain_len: 0,
+        };
+
+        let meta = EntryMeta {
+            file_path: None,
+            pack_id: None,
+            pack_offset: None,
+            crc32: None,
+            is_delta: Some(false),
+        };
+
+        tx.send(MetaAttached {
+            inner: mock_entry,
+            meta,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        // 1. 测试第一个提取出来的函数：收集
+        let collect_res = PackEncoder::collect_entries(rx).await;
+        assert!(collect_res.is_ok());
+
+        let (mut commits, mut trees, mut blobs, mut tags) = collect_res.unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(trees.len(), 0);
+
+        // 2. 测试第二个提取出来的函数：排序
+        PackEncoder::sort_all_entries(&mut commits, &mut trees, &mut blobs, &mut tags);
+
+        // 3. 显式使用所有变量，彻底断言，完美消除 Clippy 警告
+        assert_eq!(commits.len(), 1);
+        assert_eq!(trees.len(), 0);
+        assert_eq!(blobs.len(), 0);
+        assert_eq!(tags.len(), 0);
+    }
 
     /// Check if the given data is a valid pack file format by attempting to decode it.
     fn check_format(data: &Vec<u8>) {

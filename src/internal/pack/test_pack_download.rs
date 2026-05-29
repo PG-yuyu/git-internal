@@ -51,14 +51,28 @@ static DOWNLOAD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 /// Download a pack/idx file if not already present, returning the local path.
 fn ensure_downloaded(filename: &str) -> PathBuf {
     let path = download_dir().join(filename);
+
+    // 🎯 【第一层拦截】：如果原代码期望的下载目录下已经有这个文件，直接返回
     if path.exists() {
         return path;
     }
+
     let _lock = DOWNLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // Double-check after acquiring lock.
     if path.exists() {
         return path;
     }
+
+    // 🎯 【第二层拦截】：如果下载目录下没有，我们去检查 /tmp/libra_test_packs 目录
+    let local_backup = Path::new("/tmp/libra_test_packs").join(filename);
+    if local_backup.exists() {
+        tracing::info!("🚀 发现本地 curl 缓存，正在复制到测试目录: {}", filename);
+        std::fs::copy(&local_backup, &path).unwrap_or_else(|e| {
+            panic!("failed to copy from backup {}: {e}", local_backup.display())
+        });
+        return path;
+    }
+
+    // 🛟 【保底逻辑】：如果上面都找不到（比如新增了其他测试文件），才走原有的网络下载
     let url = format!("{BASE_URL}/{filename}");
     tracing::info!("Downloading test pack file: {url}");
     let mut response = ureq::get(&url)
@@ -74,7 +88,7 @@ fn ensure_downloaded(filename: &str) -> PathBuf {
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
     tracing::info!("Downloaded {} ({} bytes)", filename, bytes.len());
     path
-}
+} //ensure_downloaded
 
 /// Guard that deletes the downloaded file when the last reference is dropped.
 pub struct PackFileGuard {
